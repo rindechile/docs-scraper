@@ -8,7 +8,7 @@ import logging
 import os
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .mercadopublico import MercadoPublicoScraper
 from .d1_client import D1Client
@@ -56,7 +56,7 @@ class ScraperOrchestrator:
 
         # Stats tracking
         self.stats = {
-            'started_at': datetime.utcnow().isoformat(),
+            'started_at': datetime.now(timezone.utc).isoformat(),
             'batch_size': self.batch_size,
             'processed': 0,
             'succeeded': 0,
@@ -96,7 +96,7 @@ class ScraperOrchestrator:
                     logger.info(f"Progress: {self.stats['processed']}/{len(scrapes)}")
 
             # Step 4: Save final stats
-            self.stats['completed_at'] = datetime.utcnow().isoformat()
+            self.stats['completed_at'] = datetime.now(timezone.utc).isoformat()
             self.save_stats()
 
             logger.info(f"Completed: {self.stats['succeeded']} succeeded, {self.stats['failed']} failed")
@@ -166,7 +166,7 @@ class ScraperOrchestrator:
                 # Upload metadata
                 metadata = {
                     'chilecompra_code': chilecompra_code,
-                    'scraped_at': datetime.utcnow().isoformat(),
+                    'scraped_at': datetime.now(timezone.utc).isoformat(),
                     'pdf_report_url': result.get('pdf_report_url'),
                     'attachment_count': len(result.get('attachments', [])),
                     'files': uploaded_files

@@ -7,9 +7,9 @@ import aiohttp
 import random
 import re
 import logging
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from bs4 import BeautifulSoup
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,79 @@ class MercadoPublicoScraper:
                     await asyncio.sleep(2 ** attempt)
 
             return None
+
+    async def _post_form(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        form_data: Dict[str, str],
+        binary: bool = True
+    ) -> Optional[bytes | str]:
+        """POST form data with retry logic (for ASP.NET postbacks)"""
+        async with self.semaphore:
+            await self._rate_limit()
+
+            headers = {
+                **self.headers,
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Origin': self.BASE_URL,
+                'Referer': url,
+            }
+
+            for attempt in range(self.max_retries):
+                try:
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        data=form_data,
+                        timeout=aiohttp.ClientTimeout(total=self.timeout)
+                    ) as response:
+
+                        if response.status == 200:
+                            if binary:
+                                return await response.read()
+                            return await response.text()
+
+                        elif response.status == 429:
+                            wait = (2 ** attempt) * 10
+                            logger.warning(f"Rate limited on POST, waiting {wait}s")
+                            await asyncio.sleep(wait)
+
+                        else:
+                            logger.warning(f"HTTP {response.status} on POST: {url}")
+
+                except asyncio.TimeoutError:
+                    logger.warning(f"POST Timeout (attempt {attempt + 1}): {url}")
+                except Exception as e:
+                    logger.warning(f"POST Error (attempt {attempt + 1}): {e}")
+
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+
+            return None
+
+    def _extract_aspnet_form_fields(self, html: str) -> Dict[str, str]:
+        """Extract ASP.NET hidden form fields (__VIEWSTATE, __EVENTVALIDATION, etc.)"""
+        soup = BeautifulSoup(html, 'lxml')
+        form_data = {}
+
+        # Common ASP.NET hidden fields
+        field_names = [
+            '__VIEWSTATE',
+            '__VIEWSTATEGENERATOR',
+            '__EVENTVALIDATION',
+            '__EVENTTARGET',
+            '__EVENTARGUMENT',
+            '__PREVIOUSPAGE',
+            '__VIEWSTATEENCRYPTED',
+        ]
+
+        for name in field_names:
+            field = soup.find('input', {'name': name})
+            if field and field.get('value') is not None:
+                form_data[name] = field.get('value', '')
+
+        return form_data
 
     def _extract_qs_param(self, url: str) -> Optional[str]:
         """Extract the 'qs' parameter from URL"""
@@ -200,7 +273,7 @@ class MercadoPublicoScraper:
 
         return result
 
-    def _parse_attachments_page(self, html: str, base_url: str) -> List[Dict[str, Any]]:
+    def _parse_attachments_page(self, html: str, base_url: str) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
         """
         Parse ViewAttachmentPurchaseOrder.aspx to extract attachment info.
 
@@ -210,9 +283,17 @@ class MercadoPublicoScraper:
 
         The download is triggered by clicking input[type=image] buttons with names like
         'rptAttachment$ctl01$imgShow'. These trigger ASP.NET postbacks that download the file.
+
+        Returns:
+            Tuple of (attachments list, ASP.NET form fields dict)
         """
         soup = BeautifulSoup(html, 'lxml')
         attachments = []
+        seen_buttons = set()  # Track seen postback buttons to avoid duplicates
+
+        # Extract ASP.NET form fields for postback
+        form_fields = self._extract_aspnet_form_fields(html)
+        logger.debug(f"Extracted form fields: {list(form_fields.keys())}")
 
         # Log HTML snippet for debugging
         logger.debug(f"Attachments page HTML length: {len(html)}")
@@ -222,10 +303,15 @@ class MercadoPublicoScraper:
         logger.info(f"Found {len(tables)} tables in attachments page")
 
         for table in tables:
-            rows = table.find_all('tr')
+            rows = table.find_all('tr', recursive=False)  # Only direct children to avoid nested table dupes
+            if not rows:
+                # Try getting rows from tbody
+                tbody = table.find('tbody')
+                if tbody:
+                    rows = tbody.find_all('tr', recursive=False)
 
             for row in rows:
-                cells = row.find_all('td')
+                cells = row.find_all('td', recursive=False)
                 if len(cells) >= 3:
                     # Get text from first cells
                     filename = cells[0].get_text(strip=True)
@@ -236,8 +322,13 @@ class MercadoPublicoScraper:
                     if not filename or filename.lower() in ['nombre del anexo', 'nombre', 'anexo']:
                         continue
 
-                    # Look for download link - could be <a> or hidden in onclick
+                    # Validate filename looks like a file (has extension)
+                    if '.' not in filename or len(filename) > 100:
+                        continue
+
+                    # Look for download link - could be <a>, onclick, or ASP.NET postback button
                     download_url = None
+                    postback_button = None
 
                     # Method 1: Look for <a> tag with href
                     for cell in cells:
@@ -264,35 +355,88 @@ class MercadoPublicoScraper:
                                     download_url = f"{self.BASE_URL}{url_match.group(1)}"
                                     break
 
-                    # Method 3: For ASP.NET postback buttons, we need to extract form data
-                    # The imgShow buttons trigger postbacks - we'll need to simulate the form submission
+                    # Method 3: For ASP.NET postback buttons, extract the button name
+                    # The imgShow buttons trigger postbacks - we simulate form POST
                     if not download_url:
                         img_input = row.find('input', {'type': 'image'})
                         if img_input:
                             input_name = img_input.get('name', '')
                             input_id = img_input.get('id', '')
-                            if 'imgShow' in input_name or 'imgShow' in input_id:
-                                # Mark that this needs postback handling
-                                # For now, we'll try to find any associated hidden field or link
-                                logger.debug(f"Found imgShow button: {input_name}")
-                                # We cannot easily handle postback without session state
-                                # But sometimes there's a direct download link we missed
-                                pass
+                            if input_name and ('imgShow' in input_name or 'imgShow' in input_id or 'Show' in input_name):
+                                # Skip if we've already seen this button (duplicate from nested tables)
+                                if input_name in seen_buttons:
+                                    continue
+                                postback_button = input_name
+                                seen_buttons.add(input_name)
+                                logger.debug(f"Found postback button: {input_name} for {filename}")
 
                     if download_url:
                         attachments.append({
                             'filename': filename,
                             'file_type': file_type,
                             'date': date,
-                            'download_url': download_url
+                            'download_url': download_url,
+                            'postback_button': None
                         })
-                        logger.info(f"Found attachment: {filename} -> {download_url}")
-                    elif filename and filename.endswith('.pdf'):
+                        logger.info(f"Found attachment with direct URL: {filename} -> {download_url}")
+                    elif postback_button:
+                        attachments.append({
+                            'filename': filename,
+                            'file_type': file_type,
+                            'date': date,
+                            'download_url': None,
+                            'postback_button': postback_button
+                        })
+                        logger.info(f"Found attachment with postback: {filename} -> button={postback_button}")
+                    elif filename and (filename.endswith('.pdf') or filename.endswith('.PDF')):
                         # Log that we found a PDF but couldn't get the download URL
-                        logger.warning(f"Found attachment '{filename}' but no download URL")
+                        logger.warning(f"Found attachment '{filename}' but no download URL or postback button")
 
         logger.info(f"Parsed {len(attachments)} attachments from page")
-        return attachments
+        return attachments, form_fields
+
+    async def _download_via_postback(
+        self,
+        session: aiohttp.ClientSession,
+        page_url: str,
+        button_name: str,
+        form_fields: Dict[str, str]
+    ) -> Optional[bytes]:
+        """
+        Download a file by simulating ASP.NET postback button click.
+
+        For input[type=image] buttons, we need to POST with:
+        - All ASP.NET hidden fields (__VIEWSTATE, etc.)
+        - The button name with .x and .y coordinates (simulating image click)
+        """
+        # Build form data for postback
+        form_data = dict(form_fields)
+
+        # For input[type=image], ASP.NET expects button_name.x and button_name.y
+        # Simulate clicking at coordinates (10, 10)
+        form_data[f"{button_name}.x"] = "10"
+        form_data[f"{button_name}.y"] = "10"
+
+        logger.debug(f"Posting to {page_url} with button {button_name}")
+
+        content = await self._post_form(session, page_url, form_data, binary=True)
+
+        if content:
+            # Check if we got HTML back (error page) or actual file content
+            # PDF files start with %PDF, images have specific signatures
+            if content[:4] == b'%PDF' or content[:8] == b'\x89PNG\r\n\x1a\n' or content[:2] == b'\xff\xd8':
+                return content
+            # Check if it looks like HTML (error response)
+            try:
+                if b'<!DOCTYPE' in content[:100] or b'<html' in content[:100].lower():
+                    logger.warning(f"Got HTML response instead of file for button {button_name}")
+                    return None
+            except:
+                pass
+            # Assume it's a valid file even if we can't identify the type
+            return content
+
+        return None
 
     async def scrape_purchase(
         self,
@@ -354,16 +498,31 @@ class MercadoPublicoScraper:
                     attachments_html = await self._fetch(session, parsed['attachments_url'])
 
                     if attachments_html:
-                        attachment_list = self._parse_attachments_page(attachments_html, parsed['attachments_url'])
+                        attachment_list, form_fields = self._parse_attachments_page(attachments_html, parsed['attachments_url'])
                         logger.info(f"Found {len(attachment_list)} attachments to download")
 
                         # Step 4: Download each attachment
                         for att in attachment_list:
-                            content = await self._fetch(
-                                session,
-                                att['download_url'],
-                                binary=True
-                            )
+                            content = None
+
+                            # Try direct URL first
+                            if att.get('download_url'):
+                                content = await self._fetch(
+                                    session,
+                                    att['download_url'],
+                                    binary=True
+                                )
+
+                            # Try postback if we have a button and no direct URL
+                            elif att.get('postback_button') and form_fields:
+                                logger.info(f"Downloading '{att['filename']}' via postback button: {att['postback_button']}")
+                                content = await self._download_via_postback(
+                                    session,
+                                    parsed['attachments_url'],
+                                    att['postback_button'],
+                                    form_fields
+                                )
+
                             if content:
                                 # Detect content type
                                 content_type = 'application/octet-stream'
@@ -381,6 +540,9 @@ class MercadoPublicoScraper:
                                     'content': content,
                                     'content_type': content_type
                                 })
+                                logger.info(f"Downloaded attachment: {att['filename']} ({len(content)} bytes)")
+                            else:
+                                logger.warning(f"Failed to download attachment: {att['filename']}")
 
                 result['success'] = True
 

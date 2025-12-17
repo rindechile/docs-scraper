@@ -5,7 +5,7 @@ Cloudflare D1 API client for database operations.
 import aiohttp
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,7 @@ class D1Client:
                 updated_at = ?
             WHERE id IN ({placeholders})
             """,
-            [status, datetime.utcnow().isoformat()] + scrape_ids
+            [status, datetime.now(timezone.utc).isoformat()] + scrape_ids
         )
 
     async def update_scrape_success(
@@ -110,8 +110,8 @@ class D1Client:
                 attachment_count,
                 total_file_size,
                 pdf_report_url,
-                datetime.utcnow().isoformat(),
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
                 scrape_id
             ]
         )
@@ -130,8 +130,8 @@ class D1Client:
             """,
             [
                 error[:500],  # Truncate long errors
-                datetime.utcnow().isoformat(),
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
                 scrape_id
             ]
         )
