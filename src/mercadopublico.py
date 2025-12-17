@@ -93,58 +93,65 @@ class MercadoPublicoScraper:
         params = parse_qs(parsed.query)
         return params.get('qs', [None])[0]
 
-    def _parse_detail_page(self, html: str, detail_url: str) -> Dict[str, Any]:
+    def _parse_detail_page(self, html: str) -> Dict[str, Any]:
         """
         Parse DetailsPurchaseOrder.aspx to find:
-        1. PDF Report link (has DIFFERENT qs parameter!)
-        2. Attachments link (same qs as detail page)
+        1. PDF Report link (from onclick handler)
+        2. Attachments link (from onclick handler)
         """
         soup = BeautifulSoup(html, 'lxml')
         result = {
             'pdf_report_url': None,
-            'pdf_report_qs': None,
             'attachments_url': None,
         }
 
-        # Get the qs from detail URL for attachments
-        detail_qs = self._extract_qs_param(detail_url)
-        if detail_qs:
-            result['attachments_url'] = f"{self.BASE_URL}{self.ATTACHMENTS_PATH}?qs={detail_qs}"
+        # Find all elements with onclick handlers
+        for elem in soup.find_all(attrs={'onclick': True}):
+            onclick = elem.get('onclick', '')
 
-        # Find PDF Report link - it has a DIFFERENT qs!
-        pdf_links = soup.find_all('a', href=re.compile(r'PDFReport\.aspx'))
-        for link in pdf_links:
-            href = link.get('href', '')
-            if 'qs=' in href:
-                pdf_qs = self._extract_qs_param(href)
-                if pdf_qs:
-                    result['pdf_report_qs'] = pdf_qs
-                    result['pdf_report_url'] = f"{self.BASE_URL}{self.PDF_REPORT_PATH}?qs={pdf_qs}"
-                break
-
-        # Alternative: look for onclick handlers or other patterns
-        if not result['pdf_report_url']:
-            # Try finding in onclick or data attributes
-            for elem in soup.find_all(attrs={'onclick': re.compile(r'PDFReport')}):
-                onclick = elem.get('onclick', '')
-                match = re.search(r"qs=([^'\"&]+)", onclick)
+            # Look for PDF Report URL
+            if 'PDFReport' in onclick:
+                # Pattern: open('PDFReport.aspx?qs=...' or window.open('...')
+                match = re.search(r"'([^']*PDFReport\.aspx\?qs=[^']+)'", onclick)
                 if match:
-                    pdf_qs = match.group(1)
-                    result['pdf_report_qs'] = pdf_qs
-                    result['pdf_report_url'] = f"{self.BASE_URL}{self.PDF_REPORT_PATH}?qs={pdf_qs}"
-                    break
-
-        # Alternative: look for input buttons with onclick
-        if not result['pdf_report_url']:
-            for input_elem in soup.find_all('input', attrs={'onclick': True}):
-                onclick = input_elem.get('onclick', '')
-                if 'PDFReport' in onclick:
-                    # Extract relative URL from onclick like: open('PDFReport.aspx?qs=...'
-                    match = re.search(r"'(PDFReport\.aspx\?qs=[^']+)'", onclick)
-                    if match:
-                        relative_url = match.group(1)
+                    relative_url = match.group(1)
+                    if relative_url.startswith('http'):
+                        result['pdf_report_url'] = relative_url
+                    else:
                         result['pdf_report_url'] = f"{self.BASE_URL}/PurchaseOrder/Modules/PO/{relative_url}"
-                        break
+                    logger.info(f"Found PDF URL: {result['pdf_report_url']}")
+
+            # Look for Attachments URL (ViewAttachmentPurchaseOrder)
+            if 'ViewAttachmentPurchaseOrder' in onclick or 'Attachment' in onclick:
+                match = re.search(r"'([^']*ViewAttachmentPurchaseOrder[^']+)'", onclick)
+                if match:
+                    relative_url = match.group(1)
+                    if relative_url.startswith('http'):
+                        result['attachments_url'] = relative_url
+                    elif relative_url.startswith('/'):
+                        result['attachments_url'] = f"{self.BASE_URL}{relative_url}"
+                    else:
+                        result['attachments_url'] = f"{self.BASE_URL}/Portal/Modules/Site/AdvancedSearch/{relative_url}"
+                    logger.info(f"Found Attachments URL: {result['attachments_url']}")
+
+        # Also check href attributes for links
+        for link in soup.find_all('a', href=True):
+            href = link.get('href', '')
+
+            if 'PDFReport' in href and not result['pdf_report_url']:
+                if href.startswith('http'):
+                    result['pdf_report_url'] = href
+                else:
+                    result['pdf_report_url'] = urljoin(self.BASE_URL, href)
+
+            if 'ViewAttachmentPurchaseOrder' in href and not result['attachments_url']:
+                if href.startswith('http'):
+                    result['attachments_url'] = href
+                else:
+                    result['attachments_url'] = urljoin(self.BASE_URL, href)
+
+        # Log what we found
+        logger.info(f"Parsed detail page - PDF: {result['pdf_report_url'] is not None}, Attachments: {result['attachments_url'] is not None}")
 
         return result
 
@@ -232,7 +239,7 @@ class MercadoPublicoScraper:
                     result['error'] = "Failed to fetch detail page"
                     return result
 
-                parsed = self._parse_detail_page(detail_html, detail_url)
+                parsed = self._parse_detail_page(detail_html)
                 result['pdf_report_url'] = parsed.get('pdf_report_url')
 
                 # Step 2: Download PDF report
