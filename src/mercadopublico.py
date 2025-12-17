@@ -161,9 +161,16 @@ class MercadoPublicoScraper:
                     elif relative_url.startswith('/'):
                         result['attachments_url'] = f"{self.BASE_URL}{relative_url}"
                     else:
-                        # Use urljoin to properly resolve relative paths with ../
-                        base = f"{self.BASE_URL}/Portal/Modules/Site/AdvancedSearch/"
-                        result['attachments_url'] = urljoin(base, relative_url)
+                        # Handle relative paths - extract just the filename and qs parameter
+                        # Pattern like: ../../../Portal/Modules/Site/AdvancedSearch/ViewAttachmentPurchaseOrder.aspx?qs=...
+                        if 'ViewAttachmentPurchaseOrder.aspx' in relative_url:
+                            # Extract just the query string part
+                            qs_match = re.search(r'\?qs=([^&\s]+)', relative_url)
+                            if qs_match:
+                                qs_param = qs_match.group(1)
+                                result['attachments_url'] = f"{self.BASE_URL}/Portal/Modules/Site/AdvancedSearch/ViewAttachmentPurchaseOrder.aspx?qs={qs_param}"
+                            else:
+                                result['attachments_url'] = f"{self.BASE_URL}/Portal/Modules/Site/AdvancedSearch/ViewAttachmentPurchaseOrder.aspx"
                     logger.info(f"Found Attachments URL: {result['attachments_url']}")
 
         # Also check href attributes for links
@@ -193,48 +200,98 @@ class MercadoPublicoScraper:
 
         return result
 
-    def _parse_attachments_page(self, html: str) -> List[Dict[str, Any]]:
+    def _parse_attachments_page(self, html: str, base_url: str) -> List[Dict[str, Any]]:
         """
         Parse ViewAttachmentPurchaseOrder.aspx to extract attachment info.
 
         Expected structure:
         | Nombre del Anexo | Tipo | Fecha | Ver |
-        | COT_xxx.pdf | Cotizacion | 23-06-2025 | [link] |
+        | COT_xxx.pdf | Cotizacion | 23-06-2025 | [input button] |
+
+        The download is triggered by clicking input[type=image] buttons with names like
+        'rptAttachment$ctl01$imgShow'. These trigger ASP.NET postbacks that download the file.
         """
         soup = BeautifulSoup(html, 'lxml')
         attachments = []
 
-        # Find the table
-        table = soup.find('table')
-        if not table:
-            return attachments
+        # Log HTML snippet for debugging
+        logger.debug(f"Attachments page HTML length: {len(html)}")
 
-        rows = table.find_all('tr')
+        # Find all tables (there might be nested tables)
+        tables = soup.find_all('table')
+        logger.info(f"Found {len(tables)} tables in attachments page")
 
-        for row in rows:
-            cells = row.find_all('td')
-            if len(cells) >= 4:
-                filename = cells[0].get_text(strip=True)
-                file_type = cells[1].get_text(strip=True)
-                date = cells[2].get_text(strip=True)
+        for table in tables:
+            rows = table.find_all('tr')
 
-                # Skip header-like rows
-                if filename.lower() in ['nombre del anexo', 'nombre', '']:
-                    continue
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 3:
+                    # Get text from first cells
+                    filename = cells[0].get_text(strip=True)
+                    file_type = cells[1].get_text(strip=True) if len(cells) > 1 else ''
+                    date = cells[2].get_text(strip=True) if len(cells) > 2 else ''
 
-                # Find download link
-                download_link = cells[3].find('a') or cells[-1].find('a')
-                if download_link:
-                    href = download_link.get('href', '')
-                    if href:
-                        download_url = urljoin(self.BASE_URL, href)
+                    # Skip header-like rows or empty rows
+                    if not filename or filename.lower() in ['nombre del anexo', 'nombre', 'anexo']:
+                        continue
+
+                    # Look for download link - could be <a> or hidden in onclick
+                    download_url = None
+
+                    # Method 1: Look for <a> tag with href
+                    for cell in cells:
+                        link = cell.find('a', href=True)
+                        if link:
+                            href = link.get('href', '')
+                            if href and not href.startswith('javascript'):
+                                download_url = urljoin(base_url, href)
+                                break
+
+                    # Method 2: Look for onclick handler on any element
+                    if not download_url:
+                        for cell in cells:
+                            for elem in cell.find_all(attrs={'onclick': True}):
+                                onclick = elem.get('onclick', '')
+                                # Look for window.open or direct URL patterns
+                                url_match = re.search(r"'(https?://[^']+)'", onclick)
+                                if url_match:
+                                    download_url = url_match.group(1)
+                                    break
+                                # Look for relative URL in onclick
+                                url_match = re.search(r"'(/[^']+\.pdf[^']*)'", onclick, re.IGNORECASE)
+                                if url_match:
+                                    download_url = f"{self.BASE_URL}{url_match.group(1)}"
+                                    break
+
+                    # Method 3: For ASP.NET postback buttons, we need to extract form data
+                    # The imgShow buttons trigger postbacks - we'll need to simulate the form submission
+                    if not download_url:
+                        img_input = row.find('input', {'type': 'image'})
+                        if img_input:
+                            input_name = img_input.get('name', '')
+                            input_id = img_input.get('id', '')
+                            if 'imgShow' in input_name or 'imgShow' in input_id:
+                                # Mark that this needs postback handling
+                                # For now, we'll try to find any associated hidden field or link
+                                logger.debug(f"Found imgShow button: {input_name}")
+                                # We cannot easily handle postback without session state
+                                # But sometimes there's a direct download link we missed
+                                pass
+
+                    if download_url:
                         attachments.append({
                             'filename': filename,
                             'file_type': file_type,
                             'date': date,
                             'download_url': download_url
                         })
+                        logger.info(f"Found attachment: {filename} -> {download_url}")
+                    elif filename and filename.endswith('.pdf'):
+                        # Log that we found a PDF but couldn't get the download URL
+                        logger.warning(f"Found attachment '{filename}' but no download URL")
 
+        logger.info(f"Parsed {len(attachments)} attachments from page")
         return attachments
 
     async def scrape_purchase(
@@ -293,12 +350,12 @@ class MercadoPublicoScraper:
 
                 # Step 3: Fetch attachments page
                 if parsed.get('attachments_url'):
-                    logger.debug(f"Fetching attachments page")
+                    logger.info(f"Fetching attachments page: {parsed['attachments_url']}")
                     attachments_html = await self._fetch(session, parsed['attachments_url'])
 
                     if attachments_html:
-                        attachment_list = self._parse_attachments_page(attachments_html)
-                        logger.debug(f"Found {len(attachment_list)} attachments")
+                        attachment_list = self._parse_attachments_page(attachments_html, parsed['attachments_url'])
+                        logger.info(f"Found {len(attachment_list)} attachments to download")
 
                         # Step 4: Download each attachment
                         for att in attachment_list:
