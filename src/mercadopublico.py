@@ -94,21 +94,34 @@ class MercadoPublicoScraper:
         return params.get('qs', [None])[0]
 
     def _normalize_url(self, url: str) -> str:
-        """Normalize URL by resolving ../ and cleaning up the path"""
+        """Normalize URL by resolving ../ and cleaning up the path using urljoin"""
+        # Use a simpler approach: let the browser-style resolution handle it
+        # by joining with the base URL
         parsed = urlparse(url)
-        # Normalize the path (resolve ../ and ./)
-        path_parts = []
-        for part in parsed.path.split('/'):
-            if part == '..':
-                if path_parts:
-                    path_parts.pop()
-            elif part and part != '.':
-                path_parts.append(part)
-        normalized_path = '/' + '/'.join(path_parts)
-        # Reconstruct the URL with query string if present
-        if parsed.query:
-            return f"{parsed.scheme}://{parsed.netloc}{normalized_path}?{parsed.query}"
-        return f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
+
+        # If the path contains ../, we need to resolve it
+        if '/../' in parsed.path or parsed.path.startswith('../'):
+            # Split the path and resolve manually
+            parts = parsed.path.split('/')
+            resolved = []
+            for part in parts:
+                if part == '..':
+                    if resolved and resolved[-1] != '':
+                        resolved.pop()
+                elif part == '.':
+                    continue
+                else:
+                    resolved.append(part)
+            normalized_path = '/'.join(resolved)
+            # Ensure path starts with /
+            if not normalized_path.startswith('/'):
+                normalized_path = '/' + normalized_path
+
+            if parsed.query:
+                return f"{parsed.scheme}://{parsed.netloc}{normalized_path}?{parsed.query}"
+            return f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
+
+        return url
 
     def _parse_detail_page(self, html: str) -> Dict[str, Any]:
         """
@@ -148,7 +161,9 @@ class MercadoPublicoScraper:
                     elif relative_url.startswith('/'):
                         result['attachments_url'] = f"{self.BASE_URL}{relative_url}"
                     else:
-                        result['attachments_url'] = f"{self.BASE_URL}/Portal/Modules/Site/AdvancedSearch/{relative_url}"
+                        # Use urljoin to properly resolve relative paths with ../
+                        base = f"{self.BASE_URL}/Portal/Modules/Site/AdvancedSearch/"
+                        result['attachments_url'] = urljoin(base, relative_url)
                     logger.info(f"Found Attachments URL: {result['attachments_url']}")
 
         # Also check href attributes for links
