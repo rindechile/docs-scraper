@@ -93,6 +93,23 @@ class MercadoPublicoScraper:
         params = parse_qs(parsed.query)
         return params.get('qs', [None])[0]
 
+    def _normalize_url(self, url: str) -> str:
+        """Normalize URL by resolving ../ and cleaning up the path"""
+        parsed = urlparse(url)
+        # Normalize the path (resolve ../ and ./)
+        path_parts = []
+        for part in parsed.path.split('/'):
+            if part == '..':
+                if path_parts:
+                    path_parts.pop()
+            elif part and part != '.':
+                path_parts.append(part)
+        normalized_path = '/' + '/'.join(path_parts)
+        # Reconstruct the URL with query string if present
+        if parsed.query:
+            return f"{parsed.scheme}://{parsed.netloc}{normalized_path}?{parsed.query}"
+        return f"{parsed.scheme}://{parsed.netloc}{normalized_path}"
+
     def _parse_detail_page(self, html: str) -> Dict[str, Any]:
         """
         Parse DetailsPurchaseOrder.aspx to find:
@@ -150,8 +167,14 @@ class MercadoPublicoScraper:
                 else:
                     result['attachments_url'] = urljoin(self.BASE_URL, href)
 
+        # Normalize URLs to resolve any ../ paths
+        if result['pdf_report_url']:
+            result['pdf_report_url'] = self._normalize_url(result['pdf_report_url'])
+        if result['attachments_url']:
+            result['attachments_url'] = self._normalize_url(result['attachments_url'])
+
         # Log what we found
-        logger.info(f"Parsed detail page - PDF: {result['pdf_report_url'] is not None}, Attachments: {result['attachments_url'] is not None}")
+        logger.info(f"Parsed detail page - PDF: {result['pdf_report_url']}, Attachments: {result['attachments_url']}")
 
         return result
 
