@@ -72,17 +72,23 @@ class D1Client:
         return result.get("results", [])
 
     async def update_status(self, scrape_ids: List[int], status: str):
-        """Update scrape_status for multiple document scrapes"""
-        placeholders = ",".join(["?" for _ in scrape_ids])
-        await self._execute(
-            f"""
-            UPDATE document_scrapes
-            SET scrape_status = ?,
-                updated_at = ?
-            WHERE id IN ({placeholders})
-            """,
-            [status, datetime.now(timezone.utc).isoformat()] + scrape_ids
-        )
+        """Update scrape_status for multiple document scrapes (batched to avoid SQL variable limits)"""
+        # SQLite has a limit of ~999 variables, so we batch in chunks of 50
+        BATCH_SIZE = 50
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        for i in range(0, len(scrape_ids), BATCH_SIZE):
+            batch = scrape_ids[i:i + BATCH_SIZE]
+            placeholders = ",".join(["?" for _ in batch])
+            await self._execute(
+                f"""
+                UPDATE document_scrapes
+                SET scrape_status = ?,
+                    updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [status, timestamp] + batch
+            )
 
     async def update_scrape_success(
         self,
