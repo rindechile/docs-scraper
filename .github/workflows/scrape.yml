@@ -1,0 +1,78 @@
+name: Scrape MercadoPublico Documents
+
+on:
+  schedule:
+    # Run every 4 hours during Chilean off-peak (UTC-3)
+    # 03:00, 07:00, 11:00, 15:00, 19:00, 23:00 UTC
+    - cron: '0 3,7,11,15,19,23 * * *'
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: 'Number of documents to process'
+        required: false
+        default: '200'
+      dry_run:
+        description: 'Dry run (no uploads)'
+        required: false
+        default: 'false'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330  # 5.5 hours (under 6-hour limit)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          # Cloudflare credentials
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          # Scraper config
+          BATCH_SIZE: ${{ github.event.inputs.batch_size || '200' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          MAX_CONCURRENT: '5'
+          DELAY_MIN: '1.5'
+          DELAY_MAX: '3.0'
+        run: |
+          python -m src.main
+
+      - name: Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-logs-${{ github.run_id }}
+          path: |
+            scraper.log
+            scraper_state.json
+          retention-days: 7
+
+      - name: Report results
+        if: always()
+        run: |
+          echo "### Scraping Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f scraper_state.json ]; then
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat scraper_state.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi

@@ -1,0 +1,48 @@
+name: Manual Scrape Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      chilecompra_codes:
+        description: 'Comma-separated chilecompra codes to scrape'
+        required: true
+        default: '3707-351-AG25'
+
+jobs:
+  test-scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Test scrape specific codes
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          CHILECOMPRA_CODES: ${{ github.event.inputs.chilecompra_codes }}
+        run: |
+          python -m src.main
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-scrape-logs-${{ github.run_id }}
+          path: |
+            scraper.log
+            scraper_state.json
+          retention-days: 3
