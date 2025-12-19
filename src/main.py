@@ -104,6 +104,9 @@ class ScraperOrchestrator:
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
             raise
+        finally:
+            # Clean up HTTP sessions
+            await self.d1.close()
 
     async def process_scrape(self, scrape: dict):
         """Process a single document scrape"""
